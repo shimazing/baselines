@@ -4,7 +4,7 @@ from baselines import bench
 import gym, logging
 from baselines import logger
 
-def train(env_id, num_timesteps, seed):
+def train(env_id, num_timesteps, seed, render):
     from baselines.ppo1 import mlp_policy, pposgd_simple
     U.make_session(num_cpu=1).__enter__()
     set_global_seeds(seed)
@@ -30,9 +30,11 @@ def main():
     parser.add_argument('--env', help='environment ID', default='Hopper-v1')
     parser.add_argument('--seed', help='RNG seed', type=int, default=0)
     parser.add_argument('--num-timesteps', type=int, default=int(1e6))
+    parser.add_argument('--render', type=bool, default=False)
     args = parser.parse_args()
     logger.configure()
-    train(args.env, num_timesteps=args.num_timesteps, seed=args.seed)
+    train(args.env, num_timesteps=args.num_timesteps, seed=args.seed,
+            render=args.render)
 
 
 if __name__ == '__main__':

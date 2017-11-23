@@ -8,7 +8,13 @@ from baselines.common.mpi_moments import mpi_moments
 from mpi4py import MPI
 from collections import deque
 
-def traj_segment_generator(pi, env, horizon, stochastic):
+def traj_segment_generator(pi, env, horizon, stochastic, render=False):
+    '''
+    pi : policy_function
+    env : environment
+    horison : length of trajectory
+    stochastic : True or False
+    '''
     t = 0
     ac = env.action_space.sample() # not used, just so we have the datatype
     new = True # marks if we're on first timestep of an episode
@@ -27,9 +33,9 @@ def traj_segment_generator(pi, env, horizon, stochastic):
     acs = np.array([ac for _ in range(horizon)])
     prevacs = acs.copy()
 
-    while True:
+    while True: # TODO: check if length T trajectory does not start from init state.
         prevac = ac
-        ac, vpred = pi.act(stochastic, ob)
+        ac, vpred = pi.act(stochastic, ob) # return action and state value?
         # Slight weirdness here because we need value function at time T
         # before returning segment [0, T-1] so we get the correct
         # terminal value
@@ -37,6 +43,8 @@ def traj_segment_generator(pi, env, horizon, stochastic):
             yield {"ob" : obs, "rew" : rews, "vpred" : vpreds, "new" : news,
                     "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
                     "ep_rets" : ep_rets, "ep_lens" : ep_lens}
+            # nextvpred..! after length T trajectory, get value by value network
+
             # Be careful!!! if you change the downstream algorithm to aggregate
             # several of these batches, then be sure to do a deepcopy
             ep_rets = []
@@ -47,8 +55,8 @@ def traj_segment_generator(pi, env, horizon, stochastic):
         news[i] = new
         acs[i] = ac
         prevacs[i] = prevac
-
-        ob, rew, new, _ = env.step(ac)
+        if render: env.render() # render
+        ob, rew, new, _ = env.step(ac) # next state, reward, whether new or not
         rews[i] = rew
 
         cur_ep_ret += rew
@@ -58,7 +66,7 @@ def traj_segment_generator(pi, env, horizon, stochastic):
             ep_lens.append(cur_ep_len)
             cur_ep_ret = 0
             cur_ep_len = 0
-            ob = env.reset()
+            ob = env.reset() # 끝나면 reset하는듯..!
         t += 1
 
 def add_vtarg_and_adv(seg, gamma, lam):
@@ -75,6 +83,7 @@ def add_vtarg_and_adv(seg, gamma, lam):
         nonterminal = 1-new[t+1]
         delta = rew[t] + gamma * vpred[t+1] * nonterminal - vpred[t]
         gaelam[t] = lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
+        # TODO study for GAE (generalized advantage estimation)
     seg["tdlamret"] = seg["adv"] + seg["vpred"]
 
 def learn(env, policy_func, *,
@@ -85,7 +94,8 @@ def learn(env, policy_func, *,
         max_timesteps=0, max_episodes=0, max_iters=0, max_seconds=0,  # time constraint
         callback=None, # you can do anything in the callback, since it takes locals(), globals()
         adam_epsilon=1e-5,
-        schedule='constant' # annealing for stepsize parameters (epsilon and adam)
+        schedule='constant', # annealing for stepsize parameters (epsilon and adam)
+        render=False # rendering option
         ):
     # Setup losses and stuff
     # ----------------------------------------
@@ -130,7 +140,8 @@ def learn(env, policy_func, *,
 
     # Prepare for rollouts
     # ----------------------------------------
-    seg_gen = traj_segment_generator(pi, env, timesteps_per_actorbatch, stochastic=True)
+    seg_gen = traj_segment_generator(pi, env, timesteps_per_actorbatch,
+            stochastic=True, render=render)
 
     episodes_so_far = 0
     timesteps_so_far = 0
@@ -162,18 +173,23 @@ def learn(env, policy_func, *,
         logger.log("********** Iteration %i ************"%iters_so_far)
 
         seg = seg_gen.__next__()
-        add_vtarg_and_adv(seg, gamma, lam)
+        add_vtarg_and_adv(seg, gamma, lam) # add vtarg and advantage to seg!!
 
         # ob, ac, atarg, ret, td1ret = map(np.concatenate, (obs, acs, atargs, rets, td1rets))
         ob, ac, atarg, tdlamret = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"]
         vpredbefore = seg["vpred"] # predicted value function before udpate
         atarg = (atarg - atarg.mean()) / atarg.std() # standardized advantage function estimate
+        # TODO see why they standardize advantage for length t segment
         d = Dataset(dict(ob=ob, ac=ac, atarg=atarg, vtarg=tdlamret), shuffle=not pi.recurrent)
         optim_batchsize = optim_batchsize or ob.shape[0]
 
         if hasattr(pi, "ob_rms"): pi.ob_rms.update(ob) # update running mean/std for policy
+        # TODO what is the above line do?
 
         assign_old_eq_new() # set old parameter values to new parameter values
+        # TODO why they update old one now??? not right after the optimization
+        # is done...???? why?????
+
         logger.log("Optimizing...")
         logger.log(fmt_row(13, loss_names))
         # Here we do a bunch of optimization epochs over the data
@@ -181,7 +197,7 @@ def learn(env, policy_func, *,
             losses = [] # list of tuples, each of which gives the loss for a minibatch
             for batch in d.iterate_once(optim_batchsize):
                 *newlosses, g = lossandgrad(batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
-                adam.update(g, optim_stepsize * cur_lrmult) 
+                adam.update(g, optim_stepsize * cur_lrmult)
                 losses.append(newlosses)
             logger.log(fmt_row(13, np.mean(losses, axis=0)))
 
@@ -189,7 +205,7 @@ def learn(env, policy_func, *,
         losses = []
         for batch in d.iterate_once(optim_batchsize):
             newlosses = compute_losses(batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
-            losses.append(newlosses)            
+            losses.append(newlosses)
         meanlosses,_,_ = mpi_moments(losses, axis=0)
         logger.log(fmt_row(13, meanlosses))
         for (lossval, name) in zipsame(meanlosses, loss_names):
